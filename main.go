@@ -19,6 +19,7 @@ import (
 	"github.com/hexbytedev/hexwall/internal/pihole"
 	"github.com/hexbytedev/hexwall/internal/somo"
 	"github.com/hexbytedev/hexwall/internal/store"
+	"github.com/hexbytedev/hexwall/internal/zeek"
 )
 
 const (
@@ -28,37 +29,79 @@ const (
 	connectionScanInterval = 10 * time.Second
 )
 
-var version = "dev"
-var platform = runtime.GOOS + "/" + runtime.GOARCH
+var (
+	version  = "dev"
+	platform = runtime.GOOS + "/" + runtime.GOARCH
+)
+
+type runConfig struct {
+	dbPath        string
+	hexwallDBPath string
+	zeekLogPath   string
+	zeekNoticeLog string
+	enableZeek    bool
+	mode          string
+	debug         bool
+	showVersion   bool
+}
 
 func main() {
 	os.Exit(run())
 }
 
-func run() int {
+func parseFlags() (*runConfig, error) {
 	dbPath := flag.String("db", "", "path to pihole-FTL.db (auto-detected if not set)")
 	hexwallDB := flag.String("hexwall-db", "./hexwall.db", "path to local hexwall database")
+	zeekLogPath := flag.String("zeek-log", "", "path to zeek ssl.log for SNI-based domain verification (empty to skip)")
+	zeekNoticeLog := flag.String("zeek-notice-log", "/opt/zeek/logs/current/notice.log", "path to Zeek notice.log for DNS-bypass alerts")
+	enableZeek := flag.Bool("enable-zeek", false, "enable Zeek-based DNS-bypass detection")
 	mode := flag.String("mode", monitor.ModeWatch, "monitor mode: watch (detect only) or enforce (kill + log)")
 	debug := flag.Bool("debug", false, "enable verbose per-connection scan logging")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 
-	if *showVersion {
+	cfg := &runConfig{
+		dbPath:        strings.TrimSpace(*dbPath),
+		hexwallDBPath: strings.TrimSpace(*hexwallDB),
+		zeekLogPath:   strings.TrimSpace(*zeekLogPath),
+		zeekNoticeLog: strings.TrimSpace(*zeekNoticeLog),
+		enableZeek:    *enableZeek,
+		mode:          strings.TrimSpace(*mode),
+		debug:         *debug,
+		showVersion:   *showVersion,
+	}
+
+	if cfg.showVersion {
+		return cfg, nil
+	}
+
+	selectedMode := strings.ToLower(cfg.mode)
+	if selectedMode != monitor.ModeWatch && selectedMode != monitor.ModeEnforce {
+		return nil, fmt.Errorf("invalid --mode value %q: allowed %q or %q", cfg.mode, monitor.ModeWatch, monitor.ModeEnforce)
+	}
+	cfg.mode = selectedMode
+
+	if cfg.hexwallDBPath == "" {
+		return nil, fmt.Errorf("invalid --hexwall-db value %q", *hexwallDB)
+	}
+
+	return cfg, nil
+}
+
+func run() int {
+	cfg, err := parseFlags()
+	if err != nil {
+		slog.Error(err.Error())
+		return 1
+	}
+
+	if cfg == nil {
+		return 1
+	}
+
+	if cfg.showVersion {
 		fmt.Printf("%s (%s)\n", version, platform)
 		return 0
-	}
-
-	selectedMode := strings.ToLower(strings.TrimSpace(*mode))
-	if selectedMode != monitor.ModeWatch && selectedMode != monitor.ModeEnforce {
-		slog.Error("invalid --mode value", "mode", *mode, "allowed", []string{monitor.ModeWatch, monitor.ModeEnforce})
-		return 1
-	}
-
-	resolvedDBPath := strings.TrimSpace(*dbPath)
-	hexwallDBPath := strings.TrimSpace(*hexwallDB)
-	if hexwallDBPath == "" {
-		slog.Error("invalid --hexwall-db value", "path", *hexwallDB)
-		return 1
 	}
 
 	// Cancel background work cleanly on Ctrl+C.
@@ -72,21 +115,21 @@ func run() int {
 	}
 
 	// 2. Resolve the Pi-hole database path from --db or auto-detection.
-	if resolvedDBPath == "" {
+	if cfg.dbPath == "" {
 		detected, err := detector.FindDBPath()
 		if err != nil {
 			slog.Error("could not find pi-hole installation", "err", err)
 			return 1
 		}
 
-		resolvedDBPath = detected
-		slog.Info("pi-hole database auto-detected", "path", resolvedDBPath)
+		cfg.dbPath = detected
+		slog.Info("pi-hole database auto-detected", "path", cfg.dbPath)
 	}
 
 	// 3. Open the Pi-hole database in read-only mode.
-	checker, err := pihole.NewChecker(&pihole.Config{DBPath: resolvedDBPath})
+	checker, err := pihole.NewChecker(&pihole.Config{DBPath: cfg.dbPath})
 	if err != nil {
-		slog.Error("failed to open pi-hole database", "path", resolvedDBPath, "err", err)
+		slog.Error("failed to open pi-hole database", "path", cfg.dbPath, "err", err)
 		return 1
 	}
 	defer func() {
@@ -96,9 +139,9 @@ func run() int {
 	}()
 
 	// 4. Open the local hexwall database, creating it if needed.
-	hexwallStore, err := store.NewStore(hexwallDBPath)
+	hexwallStore, err := store.NewStore(cfg.hexwallDBPath)
 	if err != nil {
-		slog.Error("failed to open hexwall database", "path", hexwallDBPath, "err", err)
+		slog.Error("failed to open hexwall database", "path", cfg.hexwallDBPath, "err", err)
 		return 1
 	}
 	defer func() {
@@ -107,7 +150,42 @@ func run() int {
 		}
 	}()
 
-	slog.Info("hexwall database ready", "path", hexwallDBPath)
+	slog.Info("hexwall database ready", "path", cfg.hexwallDBPath)
+
+	// 4b. Start the Zeek ssl.log tailer when a path is provided.
+	var zeekClient *zeek.Client
+	if cfg.zeekLogPath != "" {
+		zc, err := zeek.NewClient(&zeek.Config{
+			LogPath: cfg.zeekLogPath,
+		})
+
+		if err != nil {
+			slog.Error("failed to start zeek log watcher", "path", cfg.zeekLogPath, "err", err)
+			return 1
+		}
+
+		defer zc.Close()
+		zeekClient = zc
+	}
+
+	var zeekEvents = make(chan zeek.Event, 100)
+	if cfg.enableZeek && cfg.zeekNoticeLog != "" {
+		go func() {
+			if err := zeek.WatchNoticeLog(ctx, cfg.zeekNoticeLog, zeekEvents); err != nil {
+				slog.Error("zeek notice watcher stopped", "path", cfg.zeekNoticeLog, "err", err)
+			}
+		}()
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case event := <-zeekEvents:
+					monitor.HandleZeekEvent(checker, hexwallStore, cfg.mode, event)
+				}
+			}
+		}()
+	}
 
 	deghostClient := deghost.NewClient(deghostBaseURL, deghostTimeout)
 
@@ -131,8 +209,8 @@ func run() int {
 	}()
 
 	fmt.Println("Starting network monitor...")
-	fmt.Printf("> Connections will be checked every %s in %s mode.\n", connectionScanInterval, selectedMode)
-	if *debug {
+	fmt.Printf("> Connections will be checked every %s in %s mode.\n", connectionScanInterval, cfg.mode)
+	if cfg.debug {
 		fmt.Println("> Debug logging is enabled for every scanned connection.")
 	}
 
@@ -146,7 +224,7 @@ func run() int {
 			slog.Info("shutting down")
 			return 0
 		case <-ticker.C:
-			monitor.RunScan(ctx, hexwallStore, deghostClient, selectedMode, *debug)
+			monitor.RunScan(ctx, checker, hexwallStore, deghostClient, zeekClient, cfg.mode, cfg.debug)
 		}
 	}
 }

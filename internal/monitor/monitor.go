@@ -12,8 +12,10 @@ import (
 
 	"github.com/hexbytedev/hexwall/internal/allowlist"
 	"github.com/hexbytedev/hexwall/internal/deghost"
+	"github.com/hexbytedev/hexwall/internal/pihole"
 	"github.com/hexbytedev/hexwall/internal/somo"
 	"github.com/hexbytedev/hexwall/internal/store"
+	"github.com/hexbytedev/hexwall/internal/zeek"
 )
 
 const (
@@ -66,8 +68,42 @@ func logScanConnection(debug bool, ip, program, status string) {
 	slog.Info("scan connection", "ip", ip, "program", program, "status", status)
 }
 
+// HandleZeekEvent evaluates a Zeek notice event against the current policy and persists it.
+func HandleZeekEvent(checker *pihole.Checker, hexwallStore *store.Store, mode string, event zeek.Event) {
+	if checker == nil || hexwallStore == nil {
+		return
+	}
+	if event.SNI == "" {
+		return
+	}
+
+	selectedMode := normalizeMode(mode)
+	blocked, err := checker.IsBlockedByPolicy(event.SNI)
+	if err != nil {
+		slog.Warn("zeek policy lookup failed", "sni", event.SNI, "err", err)
+		return
+	}
+
+	confidence := "medium"
+	actionTaken := "logged"
+	if blocked {
+		confidence = "high"
+		slog.Warn("zeek bypass alert", "src_ip", event.SrcIP, "dst_ip", event.DstIP, "dst_port", event.DstPort, "sni", event.SNI, "mode", selectedMode)
+	} else {
+		slog.Info("zeek notice was not policy-blocked", "src_ip", event.SrcIP, "dst_ip", event.DstIP, "dst_port", event.DstPort, "sni", event.SNI)
+	}
+
+	if err := hexwallStore.LogZeekAlert(event.SrcIP, event.DstIP, event.DstPort, event.SNI, blocked, confidence, actionTaken); err != nil {
+		slog.Error("failed to persist zeek alert", "src_ip", event.SrcIP, "sni", event.SNI, "err", err)
+	}
+
+	if selectedMode == ModeEnforce && blocked {
+		slog.Info("enforce mode: zeek alert recorded without direct connection kill", "src_ip", event.SrcIP, "sni", event.SNI)
+	}
+}
+
 // RunScan inspects established connections and applies the selected trust and kill policy.
-func RunScan(ctx context.Context, hexwallStore *store.Store, deghostClient *deghost.Client, mode string, debug bool) {
+func RunScan(ctx context.Context, checker *pihole.Checker, hexwallStore *store.Store, deghostClient *deghost.Client, zeekClient *zeek.Client, mode string, debug bool) {
 	if hexwallStore == nil {
 		slog.Error("scan aborted: nil hexwall store")
 		return
@@ -107,6 +143,84 @@ func RunScan(ctx context.Context, hexwallStore *store.Store, deghostClient *degh
 		// Trust allowlisted IPs immediately.
 		if allowlist.Contains(ip) {
 			logScanConnection(debug, ipStr, conn.Program, "allowed")
+			continue
+		}
+
+		sniBypass := false
+		var zeekDomain string
+		if zeekClient != nil {
+			if domain, ok := zeekClient.Lookup(conn.LPort, ipStr, conn.RPort); ok {
+				zeekDomain = domain
+				known, err := checker.IsDomainKnown(domain)
+				if err != nil {
+					slog.Debug("sni domain check failed", "domain", domain, "ip", ipStr, "err", err)
+				} else if !known {
+					sniBypass = true
+					slog.Debug("sni domain not in pihole history, bypassing IP trust", "domain", domain, "ip", ipStr)
+				}
+				if logErr := hexwallStore.LogSNIObservation(ipStr, domain, conn.LPort, known); logErr != nil {
+					slog.Debug("failed to log sni observation", "ip", ipStr, "err", logErr)
+				}
+			} else {
+				slog.Debug("zeek: no SNI seen for connection", "local_port", conn.LPort, "remote_ip", ipStr, "remote_port", conn.RPort)
+			}
+		}
+
+		if sniBypass {
+			shouldBlock, reason := false, ""
+			domain := strings.ToLower(strings.TrimSpace(zeekDomain))
+
+			if blocked, err := checker.IsBlockedByPolicy(domain); err != nil {
+				slog.Debug("domain policy check failed", "domain", domain, "err", err)
+			} else if blocked {
+				shouldBlock, reason = true, "policy-blocked"
+			}
+
+			if !shouldBlock {
+				if cached, err := hexwallStore.GetRecentDomainCheck(domain); err != nil {
+					slog.Error("domain cache lookup failed", "domain", domain, "err", err)
+					continue
+				} else if cached != nil {
+					shouldBlock = cached.ShouldBlock
+					reason = "cached-domain-check"
+				}
+			}
+
+			if !shouldBlock && reason == "" {
+				report, err := deghostClient.CheckDomain(ctx, domain)
+				if err != nil {
+					slog.Error("deghost domain check failed", "domain", domain, "program", conn.Program, "err", err)
+					continue
+				}
+
+				shouldBlock = deghost.ShouldBlockDomain(report)
+				reason = "live-domain-check"
+				if err := hexwallStore.UpsertDomainCheck(domain, shouldBlock); err != nil {
+					slog.Error("failed to cache domain check", "domain", domain, "program", conn.Program, "err", err)
+				}
+			}
+
+			if !shouldBlock {
+				slog.Info("unrecognized but clean domain", "domain", domain, "ip", ipStr, "program", conn.Program, "reason", reason)
+				logScanConnection(debug, ipStr, conn.Program, "unrecognized-clean")
+				continue
+			}
+
+			logScanConnection(debug, ipStr, conn.Program, "vulnerable")
+			slog.Warn("vulnerable connection detected", "address", conn.RAddress, "pid", conn.PID, "program", conn.Program, "reason", reason)
+			if selectedMode == ModeWatch {
+				slog.Warn("watch mode: would kill connection", "address", conn.RAddress, "pid", conn.PID, "program", conn.Program)
+				continue
+			}
+
+			if err := hexwallStore.LogKill(ipStr, conn.PID, conn.Program); err != nil {
+				slog.Error("failed to log kill", "address", conn.RAddress, "err", err)
+			}
+			if err := somo.KillConnection(conn.PID); err != nil {
+				slog.Error("failed to kill connection", "address", conn.RAddress, "pid", conn.PID, "err", err)
+			} else {
+				slog.Info("killed connection", "address", conn.RAddress)
+			}
 			continue
 		}
 

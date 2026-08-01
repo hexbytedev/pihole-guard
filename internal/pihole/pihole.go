@@ -74,6 +74,9 @@ func NewChecker(config *Config) (*Checker, error) {
 
 // Close closes the Checker database connection.
 func (c *Checker) Close() error {
+	if c == nil || c.db == nil {
+		return nil
+	}
 	return c.db.Close()
 }
 
@@ -101,6 +104,38 @@ func (c *Checker) IsDomainKnown(domain string) (bool, error) {
 	}
 	if err != nil {
 		return false, fmt.Errorf("database query failed: %w", err)
+	}
+
+	return true, nil
+}
+
+// IsBlockedByPolicy reports whether the domain currently matches a Pi-hole policy entry.
+func (c *Checker) IsBlockedByPolicy(domain string) (bool, error) {
+	domain = normalizeDomain(domain)
+	if domain == "" {
+		return false, nil
+	}
+	if c == nil || c.db == nil {
+		return false, errors.New("pihole checker is not initialized")
+	}
+
+	var found int
+	err := c.db.QueryRow(`
+		SELECT 1
+		FROM domainlist
+		WHERE type IN (1, 2)
+		  AND TRIM(domain) <> ''
+		  AND domain = ? COLLATE NOCASE
+		LIMIT 1
+	`, domain).Scan(&found)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		if strings.Contains(err.Error(), "no such table") {
+			return false, nil
+		}
+		return false, fmt.Errorf("policy lookup failed: %w", err)
 	}
 
 	return true, nil

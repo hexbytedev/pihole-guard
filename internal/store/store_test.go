@@ -95,3 +95,102 @@ func TestFraudCheckCacheExpiresAfterWindow(t *testing.T) {
 		t.Fatalf("GetRecentFraudCheck() = %#v, want nil for stale entry", entry)
 	}
 }
+
+func TestDomainCheckCacheRoundTrip(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "hexwall.db")
+
+	hexwallStore, err := NewStore(dbPath)
+	if err != nil {
+		t.Fatalf("NewStore() error = %v", err)
+	}
+	defer func() {
+		if err := hexwallStore.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	}()
+
+	entry, err := hexwallStore.GetRecentDomainCheck("evil.example.com")
+	if err != nil {
+		t.Fatalf("GetRecentDomainCheck() error = %v", err)
+	}
+	if entry != nil {
+		t.Fatalf("GetRecentDomainCheck() = %#v, want nil before insert", entry)
+	}
+
+	if err := hexwallStore.UpsertDomainCheck("evil.example.com", true); err != nil {
+		t.Fatalf("UpsertDomainCheck() error = %v", err)
+	}
+
+	entry, err = hexwallStore.GetRecentDomainCheck("evil.example.com")
+	if err != nil {
+		t.Fatalf("GetRecentDomainCheck() after insert error = %v", err)
+	}
+	if entry == nil {
+		t.Fatal("GetRecentDomainCheck() = nil, want cached entry")
+	}
+	if !entry.ShouldBlock {
+		t.Fatal("GetRecentDomainCheck().ShouldBlock = false, want true")
+	}
+	if entry.CheckedAt <= 0 {
+		t.Fatalf("GetRecentDomainCheck().CheckedAt = %d, want positive unix timestamp", entry.CheckedAt)
+	}
+}
+
+func TestDomainCheckCacheNormalizedKey(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "hexwall.db")
+
+	hexwallStore, err := NewStore(dbPath)
+	if err != nil {
+		t.Fatalf("NewStore() error = %v", err)
+	}
+	defer func() {
+		if err := hexwallStore.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	}()
+
+	if err := hexwallStore.UpsertDomainCheck("EXAMPLE.COM", false); err != nil {
+		t.Fatalf("UpsertDomainCheck() error = %v", err)
+	}
+
+	entry, err := hexwallStore.GetRecentDomainCheck("  example.com  ")
+	if err != nil {
+		t.Fatalf("GetRecentDomainCheck() error = %v", err)
+	}
+	if entry == nil {
+		t.Fatal("GetRecentDomainCheck() = nil, normalized key lookup should match")
+	}
+	if entry.ShouldBlock {
+		t.Fatal("GetRecentDomainCheck().ShouldBlock = true, want false")
+	}
+}
+
+func TestDomainCheckCacheExpiresAfterWindow(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "hexwall.db")
+
+	hexwallStore, err := NewStore(dbPath)
+	if err != nil {
+		t.Fatalf("NewStore() error = %v", err)
+	}
+	defer func() {
+		if err := hexwallStore.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	}()
+
+	staleCheckedAt := time.Now().Add(-fraudCheckCacheWindow - time.Minute).Unix()
+	if _, err := hexwallStore.readWrite.Exec(`
+		INSERT INTO domain_checks (domain, should_block, checked_at)
+		VALUES (?, ?, ?)
+	`, "stale.example.com", 1, staleCheckedAt); err != nil {
+		t.Fatalf("insert stale domain check error = %v", err)
+	}
+
+	entry, err := hexwallStore.GetRecentDomainCheck("stale.example.com")
+	if err != nil {
+		t.Fatalf("GetRecentDomainCheck() error = %v", err)
+	}
+	if entry != nil {
+		t.Fatalf("GetRecentDomainCheck() = %#v, want nil for stale entry", entry)
+	}
+}

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"strings"
 	"time"
 
 	// Register the pure-Go SQLite driver used for the local hexwall database.
@@ -43,12 +44,58 @@ CREATE TABLE IF NOT EXISTS fraud_checks (
     should_kill INTEGER NOT NULL,
     checked_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS sni_observations (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ip          TEXT    NOT NULL,
+    domain      TEXT    NOT NULL,
+    local_port  TEXT    NOT NULL,
+    known       INTEGER NOT NULL,
+    observed_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS zeek_alerts (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    src_ip       TEXT    NOT NULL,
+    dst_ip       TEXT    NOT NULL,
+    dst_port     TEXT    NOT NULL,
+    sni          TEXT    NOT NULL,
+    blocked      INTEGER NOT NULL,
+    confidence   TEXT    NOT NULL,
+    detected_at  INTEGER NOT NULL,
+    action_taken TEXT
+);
+
+CREATE TABLE IF NOT EXISTS domain_checks (
+    domain       TEXT    PRIMARY KEY,
+    should_block INTEGER NOT NULL,
+    checked_at   INTEGER NOT NULL
+);
 `
 
 // FraudCheckCacheEntry stores the cached kill decision for a prior fraud API lookup.
 type FraudCheckCacheEntry struct {
 	ShouldKill bool
 	CheckedAt  int64
+}
+
+// DomainCheckCacheEntry stores the cached block decision for a prior domain reputation lookup.
+type DomainCheckCacheEntry struct {
+	ShouldBlock bool
+	CheckedAt   int64
+}
+
+// ZeekAlertEntry stores a Zeek-derived alert that was persisted for audit.
+type ZeekAlertEntry struct {
+	ID          int64
+	SrcIP       string
+	DstIP       string
+	DstPort     string
+	SNI         string
+	Blocked     bool
+	Confidence  string
+	DetectedAt  int64
+	ActionTaken string
 }
 
 // Store wraps the local hexwall database.
@@ -254,6 +301,58 @@ func (s *Store) UpsertFraudCheck(ip string, shouldKill bool) error {
 	return nil
 }
 
+// GetRecentDomainCheck returns the cached domain-check decision when it was recorded within the cache window.
+func (s *Store) GetRecentDomainCheck(domain string) (*DomainCheckCacheEntry, error) {
+	domain = strings.ToLower(strings.TrimSpace(domain))
+	cutoff := time.Now().Add(-fraudCheckCacheWindow).Unix()
+
+	var shouldBlock int
+	var checkedAt int64
+	err := s.readOnly.QueryRow(`
+		SELECT should_block, checked_at
+		FROM domain_checks
+		WHERE domain = ?
+		  AND checked_at >= ?
+		LIMIT 1
+	`, domain, cutoff).Scan(&shouldBlock, &checkedAt)
+
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("get recent domain check for %s: %w", domain, err)
+	}
+
+	return &DomainCheckCacheEntry{
+		ShouldBlock: shouldBlock != 0,
+		CheckedAt:   checkedAt,
+	}, nil
+}
+
+// UpsertDomainCheck stores the current domain-check decision.
+func (s *Store) UpsertDomainCheck(domain string, shouldBlock bool) error {
+	domain = strings.ToLower(strings.TrimSpace(domain))
+	shouldBlockInt := 0
+	if shouldBlock {
+		shouldBlockInt = 1
+	}
+
+	_, err := s.readWrite.Exec(`
+		INSERT INTO domain_checks (domain, should_block, checked_at)
+		VALUES (?, ?, ?)
+		ON CONFLICT(domain) DO UPDATE SET
+			should_block = excluded.should_block,
+			checked_at = excluded.checked_at
+	`, domain, shouldBlockInt, time.Now().Unix())
+
+	if err != nil {
+		return fmt.Errorf("upsert domain check %s: %w", domain, err)
+	}
+
+	return nil
+}
+
 // LogKill records a killed connection in the audit log.
 func (s *Store) LogKill(ip, pid, program string) error {
 	_, err := s.readWrite.Exec(`
@@ -263,6 +362,83 @@ func (s *Store) LogKill(ip, pid, program string) error {
 
 	if err != nil {
 		return fmt.Errorf("log kill %s: %w", ip, err)
+	}
+
+	return nil
+}
+
+// LogZeekAlert persists a Zeek-derived event for later review.
+func (s *Store) LogZeekAlert(srcIP, dstIP, dstPort, sni string, blocked bool, confidence, actionTaken string) error {
+	blockedInt := 0
+	if blocked {
+		blockedInt = 1
+	}
+
+	_, err := s.readWrite.Exec(`
+		INSERT INTO zeek_alerts (src_ip, dst_ip, dst_port, sni, blocked, confidence, detected_at, action_taken)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`, srcIP, dstIP, dstPort, sni, blockedInt, confidence, time.Now().Unix(), actionTaken)
+	if err != nil {
+		return fmt.Errorf("log zeek alert %s: %w", srcIP, err)
+	}
+
+	return nil
+}
+
+// RecentZeekAlert returns the most recent Zeek alert for the given source IP and SNI.
+func (s *Store) RecentZeekAlert(srcIP, sni string) (*ZeekAlertEntry, error) {
+	cutoff := time.Now().Add(-time.Hour).Unix()
+
+	var id int64
+	var dstIP string
+	var dstPort string
+	var blockedInt int
+	var confidence string
+	var detectedAt int64
+	var actionTaken string
+	err := s.readOnly.QueryRow(`
+		SELECT id, dst_ip, dst_port, blocked, confidence, detected_at, action_taken
+		FROM zeek_alerts
+		WHERE src_ip = ?
+		  AND sni = ?
+		  AND detected_at >= ?
+		ORDER BY id DESC
+		LIMIT 1
+	`, srcIP, sni, cutoff).Scan(&id, &dstIP, &dstPort, &blockedInt, &confidence, &detectedAt, &actionTaken)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get recent zeek alert for %s: %w", srcIP, err)
+	}
+
+	return &ZeekAlertEntry{
+		ID:          id,
+		SrcIP:       srcIP,
+		DstIP:       dstIP,
+		DstPort:     dstPort,
+		SNI:         sni,
+		Blocked:     blockedInt != 0,
+		Confidence:  confidence,
+		DetectedAt:  detectedAt,
+		ActionTaken: actionTaken,
+	}, nil
+}
+
+// LogSNIObservation records an SNI domain decision for auditability.
+func (s *Store) LogSNIObservation(ip, domain, localPort string, known bool) error {
+	knownInt := 0
+	if known {
+		knownInt = 1
+	}
+
+	_, err := s.readWrite.Exec(`
+		INSERT INTO sni_observations (ip, domain, local_port, known, observed_at)
+		VALUES (?, ?, ?, ?, ?)
+	`, ip, domain, localPort, knownInt, time.Now().Unix())
+
+	if err != nil {
+		return fmt.Errorf("log sni observation %s: %w", ip, err)
 	}
 
 	return nil

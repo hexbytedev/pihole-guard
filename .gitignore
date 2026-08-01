@@ -10,3 +10,5 @@ tmp
 .vscode
 coverage.txt
 .build
+pihole-guard.db*
+inventory.ndjson
