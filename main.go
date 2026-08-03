@@ -35,15 +35,16 @@ var (
 )
 
 type runConfig struct {
-	dbPath        string
-	hexwallDBPath string
-	zeekLogPath   string
-	zeekNoticeLog string
-	enableZeek    bool
-	enableDeghost bool
-	mode          string
-	debug         bool
-	showVersion   bool
+	dbPath              string
+	hexwallDBPath       string
+	zeekLogPath         string
+	zeekNoticeLog       string
+	enableZeek          bool
+	enableDeghostIP     bool
+	enableDeghostDomain bool
+	mode                string
+	debug               bool
+	showVersion         bool
 }
 
 func main() {
@@ -56,24 +57,24 @@ func parseFlags() (*runConfig, error) {
 	zeekLogPath := flag.String("zeek-log", "", "path to zeek ssl.log for SNI-based domain verification (empty to skip)")
 	zeekNoticeLog := flag.String("zeek-notice-log", "/opt/zeek/logs/current/notice.log", "path to Zeek notice.log for DNS-bypass alerts")
 	enableZeek := flag.Bool("enable-zeek", false, "enable Zeek-based DNS-bypass detection")
-	// deghost sends every unrecognized domain the machine contacts to a third-party API.
-	// That is a real privacy cost and should be opt-in, not default.
-	enableDeghost := flag.Bool("enable-deghost", false, "enable third-party IP/domain reputation checks (privacy-sensitive; sends queried domains externally)")
+	enableDeghostIP := flag.Bool("enable-deghost-ip", true, "enable third-party IP reputation checks on the IP-only fallback path")
+	enableDeghostDomain := flag.Bool("enable-deghost-domain", true, "enable third-party domain reputation checks at rung 6")
 	mode := flag.String("mode", monitor.ModeWatch, "monitor mode: watch (detect only) or enforce (kill + log)")
 	debug := flag.Bool("debug", false, "enable debug-level logging, including verbose per-connection scan logging")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 
 	cfg := &runConfig{
-		dbPath:        strings.TrimSpace(*dbPath),
-		hexwallDBPath: strings.TrimSpace(*hexwallDB),
-		zeekLogPath:   strings.TrimSpace(*zeekLogPath),
-		zeekNoticeLog: strings.TrimSpace(*zeekNoticeLog),
-		enableZeek:    *enableZeek,
-		enableDeghost: *enableDeghost,
-		mode:          strings.TrimSpace(*mode),
-		debug:         *debug,
-		showVersion:   *showVersion,
+		dbPath:              strings.TrimSpace(*dbPath),
+		hexwallDBPath:       strings.TrimSpace(*hexwallDB),
+		zeekLogPath:         strings.TrimSpace(*zeekLogPath),
+		zeekNoticeLog:       strings.TrimSpace(*zeekNoticeLog),
+		enableZeek:          *enableZeek,
+		enableDeghostIP:     *enableDeghostIP,
+		enableDeghostDomain: *enableDeghostDomain,
+		mode:                strings.TrimSpace(*mode),
+		debug:               *debug,
+		showVersion:         *showVersion,
 	}
 
 	if cfg.showVersion {
@@ -179,6 +180,18 @@ func run() int {
 
 	slog.Info("hexwall database ready", "path", cfg.hexwallDBPath)
 
+	// 4a. Prune stale rows from prior runs at startup.
+	if result, err := hexwallStore.Prune(); err != nil {
+		slog.Warn("initial prune failed", "err", err)
+	} else if result != nil && (result.AllowedIPDomains+result.SNIObservations+result.IPObservations+result.KilledConnections+result.ZeekAlerts) > 0 {
+		slog.Info("pruned stale rows",
+			"allowed_ip_domains", result.AllowedIPDomains,
+			"sni_observations", result.SNIObservations,
+			"ip_observations", result.IPObservations,
+			"killed_connections", result.KilledConnections,
+			"zeek_alerts", result.ZeekAlerts)
+	}
+
 	// 4b. Start the Zeek ssl.log tailer when a path is provided.
 	var zeekClient *zeek.Client
 	if cfg.zeekLogPath != "" {
@@ -215,12 +228,16 @@ func run() int {
 	}
 
 	// deghost is opt-in: it sends every unrecognized domain to a third-party API,
-	// which is a real privacy cost. Only construct the client when explicitly enabled.
+	// which is a real privacy cost. Only construct the client when at least one check is enabled.
 	var deghostClient *deghost.Client
-	if cfg.enableDeghost {
+	if cfg.enableDeghostIP || cfg.enableDeghostDomain {
 		deghostClient = deghost.NewClient(deghostBaseURL, deghostTimeout)
 	} else {
 		slog.Info("deghost disabled; unrecognized connections will not be escalated to third-party API")
+	}
+
+	if cfg.mode == monitor.ModeEnforce && cfg.enableDeghostIP {
+		slog.Warn("enforce mode with IP deghost enabled: an external reputation verdict can now terminate a local process; shared cloud provider ranges are known to produce false positives on such feeds")
 	}
 
 	// 5. Refresh trusted IPs before starting the monitor so the first tick does not kill legitimate connections.
@@ -242,6 +259,30 @@ func run() int {
 		}
 	}()
 
+	// 6b. Periodically prune stale rows from the hexwall database.
+	go func() {
+		ticker := time.NewTicker(time.Hour)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if result, err := hexwallStore.Prune(); err != nil {
+					slog.Warn("periodic prune failed", "err", err)
+				} else if result != nil && (result.AllowedIPDomains+result.SNIObservations+result.IPObservations+result.KilledConnections+result.ZeekAlerts) > 0 {
+					slog.Info("pruned stale rows",
+						"allowed_ip_domains", result.AllowedIPDomains,
+						"sni_observations", result.SNIObservations,
+						"ip_observations", result.IPObservations,
+						"killed_connections", result.KilledConnections,
+						"zeek_alerts", result.ZeekAlerts)
+				}
+			}
+		}
+	}()
+
 	fmt.Println("Starting network monitor...")
 	fmt.Printf("> Connections will be checked every %s in %s mode.\n", connectionScanInterval, cfg.mode)
 	if cfg.debug {
@@ -258,7 +299,7 @@ func run() int {
 			slog.Info("shutting down")
 			return 0
 		case <-ticker.C:
-			monitor.RunScan(ctx, checker, hexwallStore, deghostClient, zeekClient, cfg.mode, cfg.debug)
+			monitor.RunScan(ctx, checker, hexwallStore, deghostClient, cfg.enableDeghostIP, cfg.enableDeghostDomain, zeekClient, cfg.mode, cfg.debug)
 		}
 	}
 }
