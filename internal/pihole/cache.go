@@ -53,12 +53,13 @@ func (c *IPCache) Refresh(ctx context.Context) {
 
 	sort.Strings(domains)
 
-	type result struct {
-		domain string
-		ips    []string
-	}
-	results := make(chan result, maxConcurrentLookups)
 	sem := make(chan struct{}, maxConcurrentLookups)
+
+	// Workers write straight into resolved under mu. Using a shared map instead of a
+	// results channel keeps a worker from ever blocking on a consumer that has not
+	// started yet, which would otherwise pin its slot in sem and stall the spawn loop.
+	var mu sync.Mutex
+	resolved := make(map[string][]string, len(domains))
 
 	var wg sync.WaitGroup
 spawnLoop:
@@ -82,26 +83,24 @@ spawnLoop:
 				// DNS failure is normal for blocked domains, expired records, and similar cases.
 				return
 			}
-			results <- result{domain: d, ips: ips}
+
+			mu.Lock()
+			resolved[d] = ips
+			mu.Unlock()
 		}(domain)
 	}
 
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	resolved := make(map[string][]string, len(domains))
-	for r := range results {
-		resolved[r.domain] = r.ips
-	}
+	wg.Wait()
 
 	if ctx.Err() != nil {
 		return
 	}
 
-	// The store keeps one domain per IP, so keep the first domain in a stable order.
-	uniqueIPs := make(map[string]string, len(resolved))
+	// A shared CDN edge IP serves many unrelated domains, so keep the full set per IP.
+	// domains is sorted, so each IP's slice stays in a stable order and its first entry
+	// is the one recorded as the representative domain in allowed_ips.
+	ipDomains := make(map[string][]string, len(resolved))
+	seen := make(map[string]struct{}, len(resolved))
 	for _, domain := range domains {
 		ips, ok := resolved[domain]
 		if !ok {
@@ -109,23 +108,34 @@ spawnLoop:
 		}
 
 		for _, ip := range ips {
-			if _, exists := uniqueIPs[ip]; exists {
+			key := ip + "\x00" + domain
+			if _, exists := seen[key]; exists {
 				continue
 			}
-			uniqueIPs[ip] = domain
+			seen[key] = struct{}{}
+			ipDomains[ip] = append(ipDomains[ip], domain)
 		}
 	}
 
 	var totalIPs int
-	for ip, domain := range uniqueIPs {
-		if err := c.store.UpsertAllowedIP(ip, domain); err != nil {
-			slog.Error("cache refresh: failed to upsert IP", "ip", ip, "domain", domain, "err", err)
+	var totalPairs int
+	for ip, ipDomainSet := range ipDomains {
+		if err := c.store.UpsertAllowedIP(ip, ipDomainSet[0]); err != nil {
+			slog.Error("cache refresh: failed to upsert IP", "ip", ip, "domain", ipDomainSet[0], "err", err)
 		} else {
 			totalIPs++
 		}
+
+		for _, domain := range ipDomainSet {
+			if err := c.store.UpsertAllowedIPDomain(ip, domain); err != nil {
+				slog.Error("cache refresh: failed to upsert IP domain", "ip", ip, "domain", domain, "err", err)
+			} else {
+				totalPairs++
+			}
+		}
 	}
 
-	slog.Info("cache refreshed", "domains", len(domains), "ips", totalIPs)
+	slog.Info("cache refreshed", "domains", len(domains), "ips", totalIPs, "pairs", totalPairs)
 }
 
 // RunRefresh calls Refresh on the given interval until ctx is cancelled.

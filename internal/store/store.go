@@ -31,6 +31,14 @@ CREATE TABLE IF NOT EXISTS allowed_ips (
     last_established INTEGER
 );
 
+CREATE TABLE IF NOT EXISTS allowed_ip_domains (
+    ip             TEXT    NOT NULL,
+    domain         TEXT    NOT NULL,
+    first_seen     INTEGER NOT NULL,
+    last_refreshed INTEGER NOT NULL,
+    PRIMARY KEY (ip, domain)
+);
+
 CREATE TABLE IF NOT EXISTS killed_connections (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
     ip        TEXT    NOT NULL,
@@ -71,6 +79,14 @@ CREATE TABLE IF NOT EXISTS domain_checks (
     should_block INTEGER NOT NULL,
     checked_at   INTEGER NOT NULL
 );
+`
+
+// backfillAllowedIPDomains seeds the per-IP domain set from the older IP-level trust table.
+// It runs on every startup: INSERT OR IGNORE makes it idempotent, and without it an upgraded
+// install would treat every Zeek-observed SNI as a mismatch until the first cache refresh.
+const backfillAllowedIPDomains = `
+INSERT OR IGNORE INTO allowed_ip_domains (ip, domain, first_seen, last_refreshed)
+SELECT ip, domain, first_approved, last_refreshed FROM allowed_ips WHERE TRIM(domain) <> '';
 `
 
 // FraudCheckCacheEntry stores the cached kill decision for a prior fraud API lookup.
@@ -121,6 +137,11 @@ func NewStore(dbPath string) (*Store, error) {
 		return nil, fmt.Errorf("failed to apply schema: %w", err)
 	}
 
+	if _, err := readWrite.Exec(backfillAllowedIPDomains); err != nil {
+		_ = readWrite.Close()
+		return nil, fmt.Errorf("failed to backfill allowed ip domains: %w", err)
+	}
+
 	readOnly, err := sql.Open("sqlite", sqliteDSN(dbPath, "ro"))
 	if err != nil {
 		_ = readWrite.Close()
@@ -140,7 +161,10 @@ func sqliteDSN(dbPath, mode string) string {
 	query := url.Values{}
 	query.Set("mode", mode)
 
-	return "file:" + (&url.URL{Path: dbPath, RawQuery: query.Encode()}).String()
+	return "file:" + (&url.URL{
+		Path:     dbPath,
+		RawQuery: query.Encode(),
+	}).String()
 }
 
 func configureConnection(db *sql.DB, readOnly bool) error {
@@ -204,6 +228,64 @@ func (s *Store) UpsertAllowedIP(ip, domain string) error {
 	}
 
 	return nil
+}
+
+// UpsertAllowedIPDomain inserts or refreshes one domain in the set of domains known for an IP.
+// Unlike allowed_ips, which keeps a single representative domain per IP, this table records
+// every domain observed for the IP so an SNI can be matched against that IP specifically.
+// On conflict, it updates last_refreshed while preserving first_seen.
+func (s *Store) UpsertAllowedIPDomain(ip, domain string) error {
+	domain = strings.ToLower(strings.TrimSpace(domain))
+	now := time.Now().Unix()
+
+	_, err := s.readWrite.Exec(`
+		INSERT INTO allowed_ip_domains (ip, domain, first_seen, last_refreshed)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT(ip, domain) DO UPDATE SET
+			last_refreshed = excluded.last_refreshed
+	`, ip, domain, now, now)
+
+	if err != nil {
+		return fmt.Errorf("upsert allowed ip domain %s/%s: %w", ip, domain, err)
+	}
+
+	return nil
+}
+
+// DomainsForIP returns every domain on file for the IP that was refreshed within the trust window.
+// It returns an empty slice when the IP has no fresh domains on record.
+func (s *Store) DomainsForIP(ip string) ([]string, error) {
+	cutoff := time.Now().Add(-refreshTrustWindow).Unix()
+
+	rows, err := s.readOnly.Query(`
+		SELECT domain
+		FROM allowed_ip_domains
+		WHERE ip = ?
+		  AND last_refreshed >= ?
+		ORDER BY domain
+	`, ip, cutoff)
+	if err != nil {
+		return nil, fmt.Errorf("domains for ip %s: %w", ip, err)
+	}
+	defer func() {
+		_ = rows.Close()
+	}()
+
+	domains := []string{}
+	for rows.Next() {
+		var domain string
+		if err := rows.Scan(&domain); err != nil {
+			return nil, fmt.Errorf("scan domain for ip %s: %w", ip, err)
+		}
+
+		domains = append(domains, domain)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate domains for ip %s: %w", ip, err)
+	}
+
+	return domains, nil
 }
 
 // UpdateEstablished stamps the current time as last_established for an IP.
@@ -334,6 +416,7 @@ func (s *Store) GetRecentDomainCheck(domain string) (*DomainCheckCacheEntry, err
 func (s *Store) UpsertDomainCheck(domain string, shouldBlock bool) error {
 	domain = strings.ToLower(strings.TrimSpace(domain))
 	shouldBlockInt := 0
+
 	if shouldBlock {
 		shouldBlockInt = 1
 	}
@@ -396,6 +479,7 @@ func (s *Store) RecentZeekAlert(srcIP, sni string) (*ZeekAlertEntry, error) {
 	var confidence string
 	var detectedAt int64
 	var actionTaken string
+
 	err := s.readOnly.QueryRow(`
 		SELECT id, dst_ip, dst_port, blocked, confidence, detected_at, action_taken
 		FROM zeek_alerts

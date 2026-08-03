@@ -40,6 +40,7 @@ type runConfig struct {
 	zeekLogPath   string
 	zeekNoticeLog string
 	enableZeek    bool
+	enableDeghost bool
 	mode          string
 	debug         bool
 	showVersion   bool
@@ -55,8 +56,11 @@ func parseFlags() (*runConfig, error) {
 	zeekLogPath := flag.String("zeek-log", "", "path to zeek ssl.log for SNI-based domain verification (empty to skip)")
 	zeekNoticeLog := flag.String("zeek-notice-log", "/opt/zeek/logs/current/notice.log", "path to Zeek notice.log for DNS-bypass alerts")
 	enableZeek := flag.Bool("enable-zeek", false, "enable Zeek-based DNS-bypass detection")
+	// deghost sends every unrecognized domain the machine contacts to a third-party API.
+	// That is a real privacy cost and should be opt-in, not default.
+	enableDeghost := flag.Bool("enable-deghost", false, "enable third-party IP/domain reputation checks (privacy-sensitive; sends queried domains externally)")
 	mode := flag.String("mode", monitor.ModeWatch, "monitor mode: watch (detect only) or enforce (kill + log)")
-	debug := flag.Bool("debug", false, "enable verbose per-connection scan logging")
+	debug := flag.Bool("debug", false, "enable debug-level logging, including verbose per-connection scan logging")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 
@@ -66,6 +70,7 @@ func parseFlags() (*runConfig, error) {
 		zeekLogPath:   strings.TrimSpace(*zeekLogPath),
 		zeekNoticeLog: strings.TrimSpace(*zeekNoticeLog),
 		enableZeek:    *enableZeek,
+		enableDeghost: *enableDeghost,
 		mode:          strings.TrimSpace(*mode),
 		debug:         *debug,
 		showVersion:   *showVersion,
@@ -98,6 +103,13 @@ func run() int {
 	if cfg == nil {
 		return 1
 	}
+
+	// Install the log handler first so every later slog call honours --debug.
+	logLevel := slog.LevelInfo
+	if cfg.debug {
+		logLevel = slog.LevelDebug
+	}
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel})))
 
 	if cfg.showVersion {
 		fmt.Printf("%s (%s)\n", version, platform)
@@ -137,6 +149,21 @@ func run() int {
 			slog.Error("failed to close pi-hole database", "err", err)
 		}
 	}()
+
+	// 3b. Log policy list summary from gravity.db.
+	if counts, err := checker.PolicyCounts(); err != nil {
+		slog.Warn("failed to read pi-hole policy counts", "err", err)
+	} else if counts != nil {
+		slog.Info("pihole policy lists loaded",
+			"allow", counts["vw_allowlist"],
+			"deny", counts["vw_denylist"],
+			"gravity", counts["vw_gravity"],
+			"regex_allow", counts["vw_regex_allowlist"],
+			"regex_deny", counts["vw_regex_denylist"])
+		if counts["vw_gravity"] == 0 {
+			slog.Warn("pi-hole gravity list is empty; blocklist may be broken or not yet downloaded")
+		}
+	}
 
 	// 4. Open the local hexwall database, creating it if needed.
 	hexwallStore, err := store.NewStore(cfg.hexwallDBPath)
@@ -187,7 +214,14 @@ func run() int {
 		}()
 	}
 
-	deghostClient := deghost.NewClient(deghostBaseURL, deghostTimeout)
+	// deghost is opt-in: it sends every unrecognized domain to a third-party API,
+	// which is a real privacy cost. Only construct the client when explicitly enabled.
+	var deghostClient *deghost.Client
+	if cfg.enableDeghost {
+		deghostClient = deghost.NewClient(deghostBaseURL, deghostTimeout)
+	} else {
+		slog.Info("deghost disabled; unrecognized connections will not be escalated to third-party API")
+	}
 
 	// 5. Refresh trusted IPs before starting the monitor so the first tick does not kill legitimate connections.
 	cache := pihole.NewIPCache(checker, hexwallStore)
