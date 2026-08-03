@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"strings"
 	"time"
@@ -20,6 +21,12 @@ const (
 	establishedTrustWindow = time.Minute
 	fraudCheckCacheWindow  = 6 * time.Hour
 	sqliteBusyTimeout      = 5 * time.Second
+
+	// Prune windows: each table is deleted on a different schedule.
+	pruneSNIWindow          = 7 * 24 * time.Hour  // SNI observations: operational state data; 7 days is enough for hand-inspection.
+	pruneKilledAlertsWindow = 90 * 24 * time.Hour // Audit tables (killed_connections, zeek_alerts): rare events, forensically valuable.
+	// fraud_checks and domain_checks are bounded by upsert-per-key and fraudCheckCacheWindow (6h);
+	// they never grow beyond one row per IP/domain and are self-cleaning on read, so pruning is unnecessary.
 )
 
 const schema = `
@@ -54,12 +61,14 @@ CREATE TABLE IF NOT EXISTS fraud_checks (
 );
 
 CREATE TABLE IF NOT EXISTS sni_observations (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
     ip          TEXT    NOT NULL,
     domain      TEXT    NOT NULL,
     local_port  TEXT    NOT NULL,
-    known       INTEGER NOT NULL,
-    observed_at INTEGER NOT NULL
+    outcome     TEXT    NOT NULL,
+    first_seen  INTEGER NOT NULL,
+    last_seen   INTEGER NOT NULL,
+    times_seen  INTEGER NOT NULL,
+    PRIMARY KEY (ip, domain, local_port)
 );
 
 CREATE TABLE IF NOT EXISTS zeek_alerts (
@@ -78,6 +87,16 @@ CREATE TABLE IF NOT EXISTS domain_checks (
     domain       TEXT    PRIMARY KEY,
     should_block INTEGER NOT NULL,
     checked_at   INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ip_observations (
+    ip          TEXT    NOT NULL,
+    program     TEXT    NOT NULL,
+    outcome     TEXT    NOT NULL,
+    first_seen  INTEGER NOT NULL,
+    last_seen   INTEGER NOT NULL,
+    times_seen  INTEGER NOT NULL,
+    PRIMARY KEY (ip, program)
 );
 `
 
@@ -101,6 +120,64 @@ type DomainCheckCacheEntry struct {
 	CheckedAt   int64
 }
 
+// SNIOutcome records which rung of the decision ladder classified a connection.
+type SNIOutcome string
+
+const (
+	OutcomePolicyAllowed SNIOutcome = "policy-allowed"
+	OutcomePolicyBlocked SNIOutcome = "policy-blocked"
+	OutcomeIPDomainMatch SNIOutcome = "ip-domain-match"
+	OutcomeUnknown       SNIOutcome = "unknown"
+)
+
+// Valid reports whether the outcome is one of the known values.
+func (o SNIOutcome) Valid() bool {
+	switch o {
+	case OutcomePolicyAllowed, OutcomePolicyBlocked, OutcomeIPDomainMatch, OutcomeUnknown:
+		return true
+	}
+	return false
+}
+
+// ParseSNIOutcome converts a string read from the database into a typed SNIOutcome.
+// Rows written by older builds may contain unrecognized values; those parse to OutcomeUnknown with false.
+func ParseSNIOutcome(s string) (SNIOutcome, bool) {
+	o := SNIOutcome(s)
+	if o.Valid() {
+		return o, true
+	}
+	return OutcomeUnknown, false
+}
+
+// IPOutcome records how a connection was classified on the IP-only fallback path.
+type IPOutcome string
+
+const (
+	OutcomeIPTrusted  IPOutcome = "ip-trusted"       // present and fresh in allowed_ips
+	OutcomeIPReserved IPOutcome = "private-reserved" // deghost returned 403: private or reserved address
+	OutcomeIPBlocked  IPOutcome = "deghost-blocked"  // deghost verdict said kill
+	OutcomeIPUnknown  IPOutcome = "unknown"          // no verdict available or check disabled
+)
+
+// Valid reports whether the outcome is one of the known values.
+func (o IPOutcome) Valid() bool {
+	switch o {
+	case OutcomeIPTrusted, OutcomeIPReserved, OutcomeIPBlocked, OutcomeIPUnknown:
+		return true
+	}
+	return false
+}
+
+// ParseIPOutcome converts a string read from the database into a typed IPOutcome.
+// Rows written by older builds may contain unrecognized values; those parse to OutcomeIPUnknown with false.
+func ParseIPOutcome(s string) (IPOutcome, bool) {
+	o := IPOutcome(s)
+	if o.Valid() {
+		return o, true
+	}
+	return OutcomeIPUnknown, false
+}
+
 // ZeekAlertEntry stores a Zeek-derived alert that was persisted for audit.
 type ZeekAlertEntry struct {
 	ID          int64
@@ -120,6 +197,46 @@ type Store struct {
 	readOnly  *sql.DB
 }
 
+// migrateSNITable detects the old event-log schema (identified by a "known" column)
+// and drops it so the new state-table schema is applied by the CREATE TABLE IF NOT EXISTS.
+// This is safe specifically because nothing in the codebase reads this table; a future reader
+// must not assume this reasoning generalises to other tables.
+func migrateSNITable(db *sql.DB) error {
+	cols, err := db.Query(`PRAGMA table_info(sni_observations)`)
+	if err != nil {
+		return fmt.Errorf("query table info: %w", err)
+	}
+	defer cols.Close()
+
+	hasOldSchema := false
+	for cols.Next() {
+		var cid int
+		var name, ctype string
+		var notNull int
+		var dfltValue sql.NullString
+		var pk int
+		if err := cols.Scan(&cid, &name, &ctype, &notNull, &dfltValue, &pk); err != nil {
+			return fmt.Errorf("scan table info: %w", err)
+		}
+		if name == "known" {
+			hasOldSchema = true
+		}
+	}
+	if err := cols.Err(); err != nil {
+		return fmt.Errorf("iterate table info: %w", err)
+	}
+
+	if !hasOldSchema {
+		return nil
+	}
+
+	slog.Warn("dropping old sni_observations table (write-only audit data; no readers)", "reason", "schema migration to state-table format")
+	if _, err := db.Exec(`DROP TABLE sni_observations`); err != nil {
+		return fmt.Errorf("drop old sni_observations: %w", err)
+	}
+	return nil
+}
+
 // NewStore opens or creates the hexwall database at dbPath and applies the schema.
 func NewStore(dbPath string) (*Store, error) {
 	readWrite, err := sql.Open("sqlite", sqliteDSN(dbPath, "rwc"))
@@ -135,6 +252,21 @@ func NewStore(dbPath string) (*Store, error) {
 	if _, err := readWrite.Exec(schema); err != nil {
 		_ = readWrite.Close()
 		return nil, fmt.Errorf("failed to apply schema: %w", err)
+	}
+
+	// Migration: detect and replace old sni_observations event-log schema with the new state table.
+	// The old table used an autoincrement id + known INTEGER, which is structurally incompatible
+	// with the new (ip, domain, local_port) primary key.  This is safe to drop because nothing in
+	// the codebase reads this table — it was only ever written to and consulted by hand.
+	if err := migrateSNITable(readWrite); err != nil {
+		_ = readWrite.Close()
+		return nil, fmt.Errorf("failed to migrate sni_observations: %w", err)
+	}
+
+	// Re-apply schema after migration so that any table dropped by migrateSNITable is recreated.
+	if _, err := readWrite.Exec(schema); err != nil {
+		_ = readWrite.Close()
+		return nil, fmt.Errorf("failed to re-apply schema after migration: %w", err)
 	}
 
 	if _, err := readWrite.Exec(backfillAllowedIPDomains); err != nil {
@@ -509,21 +641,101 @@ func (s *Store) RecentZeekAlert(srcIP, sni string) (*ZeekAlertEntry, error) {
 	}, nil
 }
 
-// LogSNIObservation records an SNI domain decision for auditability.
-func (s *Store) LogSNIObservation(ip, domain, localPort string, known bool) error {
-	knownInt := 0
-	if known {
-		knownInt = 1
-	}
+// LogSNIObservation records an SNI domain decision as a state-table upsert.
+// On first sight it inserts the row; on subsequent observations it overwrites the outcome,
+// updates last_seen, and increments times_seen while preserving first_seen.
+func (s *Store) LogSNIObservation(ip, domain, localPort string, outcome SNIOutcome) error {
+	domain = strings.ToLower(strings.TrimSpace(domain))
+	now := time.Now().Unix()
 
 	_, err := s.readWrite.Exec(`
-		INSERT INTO sni_observations (ip, domain, local_port, known, observed_at)
-		VALUES (?, ?, ?, ?, ?)
-	`, ip, domain, localPort, knownInt, time.Now().Unix())
+		INSERT INTO sni_observations (ip, domain, local_port, outcome, first_seen, last_seen, times_seen)
+		VALUES (?, ?, ?, ?, ?, ?, 1)
+		ON CONFLICT(ip, domain, local_port) DO UPDATE SET
+			outcome    = excluded.outcome,
+			last_seen  = excluded.last_seen,
+			times_seen = sni_observations.times_seen + 1
+	`, ip, domain, localPort, string(outcome), now, now)
 
 	if err != nil {
 		return fmt.Errorf("log sni observation %s: %w", ip, err)
 	}
 
 	return nil
+}
+
+// LogIPObservation records an IP-only fallback decision as a state-table upsert.
+// On first sight it inserts the row; on subsequent observations it overwrites the outcome,
+// updates last_seen, and increments times_seen while preserving first_seen.
+func (s *Store) LogIPObservation(ip, program string, outcome IPOutcome) error {
+	now := time.Now().Unix()
+
+	_, err := s.readWrite.Exec(`
+		INSERT INTO ip_observations (ip, program, outcome, first_seen, last_seen, times_seen)
+		VALUES (?, ?, ?, ?, ?, 1)
+		ON CONFLICT(ip, program) DO UPDATE SET
+			outcome    = excluded.outcome,
+			last_seen  = excluded.last_seen,
+			times_seen = ip_observations.times_seen + 1
+	`, ip, program, string(outcome), now, now)
+
+	if err != nil {
+		return fmt.Errorf("log ip observation %s: %w", ip, err)
+	}
+
+	return nil
+}
+
+// PruneResult reports how many rows were removed per table in a single Prune call.
+type PruneResult struct {
+	AllowedIPDomains  int64
+	SNIObservations   int64
+	IPObservations    int64
+	KilledConnections int64
+	ZeekAlerts        int64
+}
+
+// Prune removes stale rows from all pruneable tables.
+// It returns the number of rows deleted per table so the caller can log a summary.
+func (s *Store) Prune() (*PruneResult, error) {
+	now := time.Now().Unix()
+	result := &PruneResult{}
+
+	// allowed_ip_domains: rows older than refreshTrustWindow are already excluded by
+	// DomainsForIP and can never grant trust again. Safe to remove.
+	r, err := s.readWrite.Exec(`DELETE FROM allowed_ip_domains WHERE last_refreshed < ?`, now-int64(refreshTrustWindow.Seconds()))
+	if err != nil {
+		return nil, fmt.Errorf("prune allowed_ip_domains: %w", err)
+	}
+	result.AllowedIPDomains, _ = r.RowsAffected()
+
+	// sni_observations: operational state data with a 7-day window.
+	r, err = s.readWrite.Exec(`DELETE FROM sni_observations WHERE last_seen < ?`, now-int64(pruneSNIWindow.Seconds()))
+	if err != nil {
+		return nil, fmt.Errorf("prune sni_observations: %w", err)
+	}
+	result.SNIObservations, _ = r.RowsAffected()
+
+	// ip_observations: same 7-day window as sni_observations.
+	r, err = s.readWrite.Exec(`DELETE FROM ip_observations WHERE last_seen < ?`, now-int64(pruneSNIWindow.Seconds()))
+	if err != nil {
+		return nil, fmt.Errorf("prune ip_observations: %w", err)
+	}
+	result.IPObservations, _ = r.RowsAffected()
+
+	// killed_connections and zeek_alerts: audit records of rare, potentially forensically
+	// valuable events. 90-day window keeps a meaningful history without unbounded growth.
+	r, err = s.readWrite.Exec(`DELETE FROM killed_connections WHERE killed_at < ?`, now-int64(pruneKilledAlertsWindow.Seconds()))
+	if err != nil {
+		return nil, fmt.Errorf("prune killed_connections: %w", err)
+	}
+	result.KilledConnections, _ = r.RowsAffected()
+
+	r, err = s.readWrite.Exec(`DELETE FROM zeek_alerts WHERE detected_at < ?`, now-int64(pruneKilledAlertsWindow.Seconds()))
+	if err != nil {
+		return nil, fmt.Errorf("prune zeek_alerts: %w", err)
+	}
+	result.ZeekAlerts, _ = r.RowsAffected()
+
+	return result, nil
 }
