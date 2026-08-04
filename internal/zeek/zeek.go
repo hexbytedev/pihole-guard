@@ -254,7 +254,11 @@ func (c *Client) processNewLines() {
 		slog.Debug("zeek: cannot open ssl.log", "path", c.logPath, "err", err)
 		return
 	}
-	defer file.Close()
+	defer func() {
+		if err := file.Close(); err != nil {
+			slog.Debug("zeek: failed to close ssl.log", "path", c.logPath, "err", err)
+		}
+	}()
 
 	fi, err := file.Stat()
 	if err != nil {

@@ -178,7 +178,7 @@ func RunScan(ctx context.Context, checker *pihole.Checker, hexwallStore *store.S
 
 		if !sniFound {
 			// Rung 7: IP-only fallback — no SNI means non-TLS, pre-existing connection, or ECH.
-			action := evaluateIPOnly(ctx, hexwallStore, deghostClient, deghostIP, checker, ipStr, conn, selectedMode, debug)
+			action := evaluateIPOnly(ctx, hexwallStore, deghostClient, deghostIP, ipStr, conn, selectedMode, debug)
 			applyOutcome(&summary, action)
 			continue
 		}
@@ -297,7 +297,7 @@ func RunScan(ctx context.Context, checker *pihole.Checker, hexwallStore *store.S
 // evaluateIPOnly handles the IP-only fallback path (rung 7) when no SNI is available.
 // It returns "trusted", "blocked", "unknown", or "error".
 // Every exit path records an IP observation before returning.
-func evaluateIPOnly(ctx context.Context, hexwallStore *store.Store, deghostClient *deghost.Client, deghostIP bool, checker *pihole.Checker, ipStr string, conn somo.Connection, mode string, debug bool) string {
+func evaluateIPOnly(ctx context.Context, hexwallStore *store.Store, deghostClient *deghost.Client, deghostIP bool, ipStr string, conn somo.Connection, mode string, debug bool) string {
 	allowed, err := hexwallStore.IsAllowed(ipStr)
 	if err != nil {
 		slog.Error("store lookup failed", "address", conn.RAddress, "err", err)

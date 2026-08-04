@@ -68,7 +68,7 @@ func TestCheckDomainStatusForbiddenDecodesBody(t *testing.T) {
 		DomainAgeInDays: 0,
 	}
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusForbidden)
 		_ = json.NewEncoder(w).Encode(want)
 	}))
@@ -97,7 +97,7 @@ func TestCheckDomainStatusBadRequestDecodesBody(t *testing.T) {
 		DomainAgeInDays: 0,
 	}
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		_ = json.NewEncoder(w).Encode(want)
 	}))
@@ -119,7 +119,7 @@ func TestCheckDomainStatusBadRequestDecodesBody(t *testing.T) {
 func TestCheckDomainStatusInternalServerError(t *testing.T) {
 	t.Parallel()
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	defer srv.Close()
@@ -134,7 +134,7 @@ func TestCheckDomainStatusInternalServerError(t *testing.T) {
 func TestCheckDomainStatusGatewayTimeout(t *testing.T) {
 	t.Parallel()
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusGatewayTimeout)
 	}))
 	defer srv.Close()
@@ -149,7 +149,7 @@ func TestCheckDomainStatusGatewayTimeout(t *testing.T) {
 func TestCheckDomainStatusClientClosedRequest(t *testing.T) {
 	t.Parallel()
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(499)
 	}))
 	defer srv.Close()
@@ -164,9 +164,11 @@ func TestCheckDomainStatusClientClosedRequest(t *testing.T) {
 func TestCheckDomainMalformedJSON(t *testing.T) {
 	t.Parallel()
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"status": "allowed" bad json`)
+		if _, err := fmt.Fprint(w, `{"status": "allowed" bad json`); err != nil {
+			t.Errorf("fmt.Fprint: %v", err)
+		}
 	}))
 	defer srv.Close()
 

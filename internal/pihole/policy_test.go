@@ -98,7 +98,11 @@ func TestIsBlockedByPolicy_Denylist(t *testing.T) {
 	_ = gravDB.Close()
 
 	checker := newTestChecker(t, gravPath)
-	defer checker.Close()
+	defer func() {
+		if err := checker.Close(); err != nil {
+			t.Errorf("checker.Close(): %v", err)
+		}
+	}()
 
 	blocked, err := checker.IsBlockedByPolicy("blocked.example.com")
 	if err != nil {
@@ -116,7 +120,11 @@ func TestIsBlockedByPolicy_Gravity(t *testing.T) {
 	_ = gravDB.Close()
 
 	checker := newTestChecker(t, gravPath)
-	defer checker.Close()
+	defer func() {
+		if err := checker.Close(); err != nil {
+			t.Errorf("checker.Close(): %v", err)
+		}
+	}()
 
 	blocked, err := checker.IsBlockedByPolicy("malware.example.net")
 	if err != nil {
@@ -134,7 +142,11 @@ func TestIsBlockedByPolicy_NoMatch(t *testing.T) {
 	_ = gravDB.Close()
 
 	checker := newTestChecker(t, gravPath)
-	defer checker.Close()
+	defer func() {
+		if err := checker.Close(); err != nil {
+			t.Errorf("checker.Close(): %v", err)
+		}
+	}()
 
 	blocked, err := checker.IsBlockedByPolicy("safe.example.org")
 	if err != nil {
@@ -152,7 +164,11 @@ func TestIsAllowedByPolicy_Allowlist(t *testing.T) {
 	_ = gravDB.Close()
 
 	checker := newTestChecker(t, gravPath)
-	defer checker.Close()
+	defer func() {
+		if err := checker.Close(); err != nil {
+			t.Errorf("checker.Close(): %v", err)
+		}
+	}()
 
 	allowed, err := checker.IsAllowedByPolicy("trusted.example.com")
 	if err != nil {
@@ -170,7 +186,11 @@ func TestIsAllowedByPolicy_NoMatch(t *testing.T) {
 	_ = gravDB.Close()
 
 	checker := newTestChecker(t, gravPath)
-	defer checker.Close()
+	defer func() {
+		if err := checker.Close(); err != nil {
+			t.Errorf("checker.Close(): %v", err)
+		}
+	}()
 
 	allowed, err := checker.IsAllowedByPolicy("unknown.example.org")
 	if err != nil {
@@ -190,7 +210,11 @@ func TestPolicyLookup_CaseNormalization(t *testing.T) {
 	_ = gravDB.Close()
 
 	checker := newTestChecker(t, gravPath)
-	defer checker.Close()
+	defer func() {
+		if err := checker.Close(); err != nil {
+			t.Errorf("checker.Close(): %v", err)
+		}
+	}()
 
 	// Denylist: case-insensitive match
 	blocked, err := checker.IsBlockedByPolicy(" casesensitive.com ")
@@ -227,7 +251,11 @@ func TestPolicyLookup_EmptyDomain(t *testing.T) {
 	_ = gravDB.Close()
 
 	checker := newTestChecker(t, gravPath)
-	defer checker.Close()
+	defer func() {
+		if err := checker.Close(); err != nil {
+			t.Errorf("checker.Close(): %v", err)
+		}
+	}()
 
 	blocked, err := checker.IsBlockedByPolicy("")
 	if err != nil {
@@ -287,7 +315,11 @@ func TestPolicyCounts(t *testing.T) {
 	_ = gravDB.Close()
 
 	checker := newTestChecker(t, gravPath)
-	defer checker.Close()
+	defer func() {
+		if err := checker.Close(); err != nil {
+			t.Errorf("checker.Close(): %v", err)
+		}
+	}()
 
 	counts, err := checker.PolicyCounts()
 	if err != nil {
@@ -358,7 +390,11 @@ func TestGravityDBPath_Derived(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewChecker() error = %v", err)
 	}
-	defer checker.Close()
+	defer func() {
+		if err := checker.Close(); err != nil {
+			t.Errorf("checker.Close(): %v", err)
+		}
+	}()
 
 	if checker.gravityDB == nil {
 		t.Fatal("gravityDB is nil, want it to be auto-discovered")
@@ -385,7 +421,11 @@ func TestGravityDBPath_Missing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewChecker() error = %v, want nil when gravity.db is missing", err)
 	}
-	defer checker.Close()
+	defer func() {
+		if err := checker.Close(); err != nil {
+			t.Errorf("checker.Close(): %v", err)
+		}
+	}()
 
 	if checker.gravityDB != nil {
 		t.Fatal("gravityDB is non-nil, want nil when gravity.db is missing")
@@ -429,7 +469,11 @@ func TestIsBlockedByPolicy_DenylistBeatsGravity(t *testing.T) {
 	_ = gravDB.Close()
 
 	checker := newTestChecker(t, gravPath)
-	defer checker.Close()
+	defer func() {
+		if err := checker.Close(); err != nil {
+			t.Errorf("checker.Close(): %v", err)
+		}
+	}()
 
 	blocked, err := checker.IsBlockedByPolicy("both.example.com")
 	if err != nil {
@@ -448,7 +492,11 @@ func TestIsAllowedByPolicy_TakesPrecedenceOverGravity(t *testing.T) {
 	_ = gravDB.Close()
 
 	checker := newTestChecker(t, gravPath)
-	defer checker.Close()
+	defer func() {
+		if err := checker.Close(); err != nil {
+			t.Errorf("checker.Close(): %v", err)
+		}
+	}()
 
 	// Allowlist match should be independent of gravity presence.
 	allowed, err := checker.IsAllowedByPolicy("special.example.com")
@@ -467,7 +515,11 @@ func TestIsBlockedByPolicy_WhitespaceNormalization(t *testing.T) {
 	_ = gravDB.Close()
 
 	checker := newTestChecker(t, gravPath)
-	defer checker.Close()
+	defer func() {
+		if err := checker.Close(); err != nil {
+			t.Errorf("checker.Close(): %v", err)
+		}
+	}()
 
 	blocked, err := checker.IsBlockedByPolicy("  Trim.Example.COM  ")
 	if err != nil {

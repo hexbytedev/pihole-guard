@@ -202,12 +202,11 @@ func (c *Checker) IsBlockedByPolicy(domain string) (bool, error) {
 		WHERE domain = ? COLLATE NOCASE
 		LIMIT 1
 	`, domain).Scan(&found)
-	if errors.Is(err, sql.ErrNoRows) {
-		// Not in denylist; check gravity.
-	} else if err != nil {
-		return false, fmt.Errorf("denylist lookup failed: %w", err)
-	} else {
+	if err == nil {
 		return true, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return false, fmt.Errorf("denylist lookup failed: %w", err)
 	}
 
 	err = c.gravityDB.QueryRow(`

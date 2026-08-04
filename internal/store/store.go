@@ -124,10 +124,14 @@ type DomainCheckCacheEntry struct {
 type SNIOutcome string
 
 const (
+	// OutcomePolicyAllowed indicates the connection was allowed by Pi-hole policy.
 	OutcomePolicyAllowed SNIOutcome = "policy-allowed"
+	// OutcomePolicyBlocked indicates the connection was blocked by Pi-hole policy.
 	OutcomePolicyBlocked SNIOutcome = "policy-blocked"
+	// OutcomeIPDomainMatch indicates the SNI domain matched a known domain for the IP.
 	OutcomeIPDomainMatch SNIOutcome = "ip-domain-match"
-	OutcomeUnknown       SNIOutcome = "unknown"
+	// OutcomeUnknown indicates the connection could not be classified.
+	OutcomeUnknown SNIOutcome = "unknown"
 )
 
 // Valid reports whether the outcome is one of the known values.
@@ -153,10 +157,14 @@ func ParseSNIOutcome(s string) (SNIOutcome, bool) {
 type IPOutcome string
 
 const (
-	OutcomeIPTrusted  IPOutcome = "ip-trusted"       // present and fresh in allowed_ips
-	OutcomeIPReserved IPOutcome = "private-reserved" // deghost returned 403: private or reserved address
-	OutcomeIPBlocked  IPOutcome = "deghost-blocked"  // deghost verdict said kill
-	OutcomeIPUnknown  IPOutcome = "unknown"          // no verdict available or check disabled
+	// OutcomeIPTrusted indicates the IP is present and fresh in allowed_ips.
+	OutcomeIPTrusted IPOutcome = "ip-trusted"
+	// OutcomeIPReserved indicates deghost returned 403: private or reserved address.
+	OutcomeIPReserved IPOutcome = "private-reserved"
+	// OutcomeIPBlocked indicates deghost verdict said kill.
+	OutcomeIPBlocked IPOutcome = "deghost-blocked"
+	// OutcomeIPUnknown indicates no verdict available or check disabled.
+	OutcomeIPUnknown IPOutcome = "unknown"
 )
 
 // Valid reports whether the outcome is one of the known values.
@@ -206,7 +214,11 @@ func migrateSNITable(db *sql.DB) error {
 	if err != nil {
 		return fmt.Errorf("query table info: %w", err)
 	}
-	defer cols.Close()
+	defer func() {
+		if err := cols.Close(); err != nil {
+			slog.Debug("failed to close columns", "err", err)
+		}
+	}()
 
 	hasOldSchema := false
 	for cols.Next() {
