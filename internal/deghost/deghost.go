@@ -119,3 +119,79 @@ func ShouldKill(report *IPReport) bool {
 
 	return report.Security.IsAbuser || report.Security.IsAttacker || report.Security.IsThreat
 }
+
+// DomainReport matches the API payload for domain reputation checks.
+type DomainReport struct {
+	Status          string `json:"status"`
+	HasMX           bool   `json:"has_mx"`
+	Disposable      bool   `json:"disposable"`
+	Spam            bool   `json:"spam"`
+	PublicDomain    bool   `json:"public_domain"`
+	RelayDomain     bool   `json:"relay_domain"`
+	Blacklisted     bool   `json:"blacklisted"`
+	DomainAgeInDays int    `json:"domain_age_in_days"`
+}
+
+// CheckDomain fetches a reputation report for a single domain.
+// Unlike CheckIP's 403 handling (nil report for private/reserved IPs), this endpoint
+// returns a real JSON body on HTTP 200, 400, and 403 — all are decoded into a DomainReport.
+// Only 499/504/500/other status codes are treated as hard errors.
+func (c *Client) CheckDomain(ctx context.Context, domain string) (*DomainReport, error) {
+	if c == nil {
+		return nil, errors.New("nil deghost client")
+	}
+	if c.httpClient == nil {
+		return nil, errors.New("nil deghost http client")
+	}
+
+	baseURL := strings.TrimSpace(c.baseURL)
+	if baseURL == "" {
+		return nil, errors.New("deghost base URL is required")
+	}
+
+	domain = strings.ToLower(strings.TrimSpace(domain))
+	if domain == "" {
+		return nil, errors.New("domain is required")
+	}
+
+	endpoint, err := url.JoinPath(baseURL, "domain", domain)
+	if err != nil {
+		return nil, fmt.Errorf("build endpoint: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build request: %w", err)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusBadRequest && resp.StatusCode != http.StatusForbidden {
+		return nil, fmt.Errorf("deghost returned status %d %s", resp.StatusCode, http.StatusText(resp.StatusCode))
+	}
+
+	var report DomainReport
+	if err := json.NewDecoder(resp.Body).Decode(&report); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+
+	return &report, nil
+}
+
+// ShouldBlockDomain reports whether the domain report matches the current block policy.
+// It triggers only on explicit negative signals (status "not_allowed" or blacklisted),
+// ignoring softer signals like disposable, spam, or domain age which are too noisy
+// to act on alone — consistent with how ShouldKill only fires on explicit threat fields.
+func ShouldBlockDomain(report *DomainReport) bool {
+	if report == nil {
+		return false
+	}
+
+	return report.Status == "not_allowed" || report.Blacklisted
+}

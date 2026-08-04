@@ -46,28 +46,6 @@ func GetEstablishedConnections() ([]Connection, error) {
 	return result, nil
 }
 
-// KillConnection kills a process by PID via somo.
-func KillConnection(pid string) error {
-	pid = strings.TrimSpace(pid)
-	if pid == "" || pid == "-" {
-		return fmt.Errorf("invalid PID %q", pid)
-	}
-
-	for _, r := range pid {
-		if r < '0' || r > '9' {
-			return fmt.Errorf("invalid PID %q", pid)
-		}
-	}
-
-	cmd := exec.Command("somo", "-k", "-p", pid)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return commandError(fmt.Sprintf("failed to kill connection with PID %s", pid), err, output)
-	}
-
-	return nil
-}
-
 func commandError(message string, err error, output []byte) error {
 	trimmed := strings.TrimSpace(string(output))
 	if trimmed == "" {

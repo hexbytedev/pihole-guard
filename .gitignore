@@ -10,3 +10,14 @@ tmp
 .vscode
 coverage.txt
 .build
+pihole-guard.db*
+inventory.ndjson
+
+# local design notes and session artifacts — not for publication
+CHAT_SUMMARY_*.md
+CLAUDE.md
+OVERVIEW.md
+SETUP.md
+SNI_DETECTION_DESIGN.md
+zeek-integration-guide.md
+IMPLEMENTATION_NOTES.md
